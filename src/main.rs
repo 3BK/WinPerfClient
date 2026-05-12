@@ -15,6 +15,11 @@ use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::ERROR_PIPE_BUSY;
 use windows::Win32::System::Performance::*;
 
+// PDH handles in the current `windows` crate bindings are represented as `isize`
+// (the `PDH_HQUERY` / `PDH_HCOUNTER` typedefs are not exported as named types). 【1-2ccd0d】
+type PdhQueryHandle = isize;
+type PdhCounterHandle = isize;
+
 #[derive(Deserialize)]
 struct Config {
     interval_seconds: u64,
@@ -51,7 +56,6 @@ fn sanitize_for_log(s: &str) -> String {
 /// - NotFound: server not up yet
 /// - ERROR_PIPE_BUSY: server exists but busy; sleep and retry
 async fn open_pipe_with_retry(pipe_name: &str) -> io::Result<NamedPipeClient> {
-    // Tune: these are conservative and cheap at your cadence (10s interval).
     const ATTEMPTS: usize = 10;
     const SLEEP_MS: u64 = 50;
 
@@ -61,21 +65,18 @@ async fn open_pipe_with_retry(pipe_name: &str) -> io::Result<NamedPipeClient> {
         match ClientOptions::new().open(pipe_name) {
             Ok(client) => return Ok(client),
             Err(e) => {
-                // Retry on "server not present yet"
                 if e.kind() == ErrorKind::NotFound {
                     last_err = Some(e);
                     sleep(Duration::from_millis(SLEEP_MS)).await;
                     continue;
                 }
 
-                // Retry on ERROR_PIPE_BUSY
                 if e.raw_os_error() == Some(ERROR_PIPE_BUSY.0 as i32) {
                     last_err = Some(e);
                     sleep(Duration::from_millis(SLEEP_MS)).await;
                     continue;
                 }
 
-                // Anything else: fail fast
                 return Err(e);
             }
         }
@@ -85,8 +86,8 @@ async fn open_pipe_with_retry(pipe_name: &str) -> io::Result<NamedPipeClient> {
 }
 
 async fn run_service(cfg: Config) -> anyhow::Result<()> {
-    // Use the binding type for PDH handles (CWE-843).
-    let mut h_query: PDH_HQUERY = PDH_HQUERY::default();
+    // PDH query handle (binding-compatible type). 【1-2ccd0d】
+    let mut h_query: PdhQueryHandle = 0;
 
     // PDH: Open Query
     let status = unsafe { PdhOpenQueryW(None, 0, &mut h_query) };
@@ -94,20 +95,20 @@ async fn run_service(cfg: Config) -> anyhow::Result<()> {
         anyhow::bail!("PdhOpenQueryW failed with status: {}", status);
     }
 
-    // CWE-404/CWE-843: typed RAII guard for correct shutdown/release.
-    // NOTE: This expects secure_guard::PdhQueryGuard::new(PDH_HQUERY).
+    // RAII guard ensures PdhCloseQuery is called on drop.
+    // NOTE: secure_guard::PdhQueryGuard::new expects `isize` after the fix. 【1-2ccd0d】
     let _guard = secure_guard::PdhQueryGuard::new(h_query);
 
     // Add counters
-    let mut counters: Vec<(String, PDH_HCOUNTER)> = Vec::new();
+    let mut counters: Vec<(String, PdhCounterHandle)> = Vec::new();
     for m in &cfg.metrics {
-        let mut h_c: PDH_HCOUNTER = PDH_HCOUNTER::default();
+        let mut h_c: PdhCounterHandle = 0;
         let path = HSTRING::from(&m.path);
+
         let status = unsafe { PdhAddCounterW(h_query, PCWSTR(path.as_ptr()), 0, &mut h_c) };
         if status == 0 {
             counters.push((m.tag.clone(), h_c));
         } else {
-            // CWE-117: sanitize config-controlled content
             warn!(
                 "Failed to add counter: {} (status: {})",
                 sanitize_for_log(&m.path),
@@ -162,7 +163,6 @@ async fn run_service(cfg: Config) -> anyhow::Result<()> {
                 continue;
             }
 
-            // PDH marks validity via CStatus
             if v.CStatus != 0 {
                 continue;
             }
@@ -174,7 +174,6 @@ async fn run_service(cfg: Config) -> anyhow::Result<()> {
             });
         }
 
-        // If nothing valid, continue quietly.
         if samples.is_empty() {
             continue;
         }
@@ -218,6 +217,7 @@ async fn run_service(cfg: Config) -> anyhow::Result<()> {
 async fn main() {
     // Initialize global logger for Event Viewer auditing
     if let Err(e) = audit::WinEventLogger::init("WinPerfClient") {
+        // Prefer stderr here because logger failed to initialize.
         eprintln!("Failed to initialize Windows Event Logger: {e}");
         return;
     }
