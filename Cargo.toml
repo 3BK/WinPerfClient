@@ -1,0 +1,37 @@
+[package]
+name = "win-perf-client"
+version = "1.0.0"
+edition = "2024"
+authors = ["Enterprise Security Team"]
+description = "A Static Windows Performance Metrics Client"
+
+[dependencies]
+windows = { version = "0.58", features = [
+    "Win32_System_Performance", # PDH Counters
+    "Win32_Foundation",         # HANDLE and WIN32_ERROR
+    "Win32_System_EventLog",    # Windows Event Viewer auditing
+    "Win32_Security",           # Permission checks
+    "Win32_Storage_FileSystem", # Named Pipe support
+] }
+
+# Async Runtime: Industry standard for high-concurrency IPC
+tokio = { version = "1.38", features = ["full"] }
+
+zeroize = { version = "1.8", features = ["derive"] }
+
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+
+# Reliability and Standards
+chrono = { version = "0.4", features = ["serde"] } # Time-series precision
+anyhow = "1.0"                                     # Robust error propagation
+
+[target.'cfg(windows)'.dependencies]
+windows-targets = "0.52"
+
+[profile.release]
+opt-level = 3
+lto = true              # Link-Time Optimization for better performance/security
+codegen-units = 1       # Better optimization and deterministic builds
+panic = "abort"         # Compliance: Predictable resource cleanup on failure
+strip = true            # NIST: Remove symbols to reduce reverse-engineering surface
