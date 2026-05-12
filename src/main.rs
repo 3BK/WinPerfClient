@@ -3,14 +3,16 @@ mod audit;
 mod metrics;
 
 use std::time::Duration;
+use std::{io, io::ErrorKind};
 
-use anyhow::Context;
 use log::{error, info, warn};
 use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
-use tokio::net::windows::named_pipe::ClientOptions;
+use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
+use tokio::time::sleep;
 
 use windows::core::{HSTRING, PCWSTR};
+use windows::Win32::Foundation::ERROR_PIPE_BUSY;
 use windows::Win32::System::Performance::*;
 
 #[derive(Deserialize)]
@@ -26,8 +28,64 @@ struct MetricDef {
     path: String,
 }
 
+/// CWE-117: neutralize CR/LF to prevent log injection / record forging.
+/// Keep it cheap: single pass, cap length to avoid log bloat.
+fn sanitize_for_log(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\r' | '\n' => out.push(' '),
+            _ => out.push(ch),
+        }
+    }
+    const MAX: usize = 512;
+    if out.len() > MAX {
+        out.truncate(MAX);
+        out.push_str("…");
+    }
+    out
+}
+
+/// Open a named pipe with bounded retries.
+/// Tokio docs call out two common connection-time errors:
+/// - NotFound: server not up yet
+/// - ERROR_PIPE_BUSY: server exists but busy; sleep and retry
+async fn open_pipe_with_retry(pipe_name: &str) -> io::Result<NamedPipeClient> {
+    // Tune: these are conservative and cheap at your cadence (10s interval).
+    const ATTEMPTS: usize = 10;
+    const SLEEP_MS: u64 = 50;
+
+    let mut last_err: Option<io::Error> = None;
+
+    for _ in 0..ATTEMPTS {
+        match ClientOptions::new().open(pipe_name) {
+            Ok(client) => return Ok(client),
+            Err(e) => {
+                // Retry on "server not present yet"
+                if e.kind() == ErrorKind::NotFound {
+                    last_err = Some(e);
+                    sleep(Duration::from_millis(SLEEP_MS)).await;
+                    continue;
+                }
+
+                // Retry on ERROR_PIPE_BUSY
+                if e.raw_os_error() == Some(ERROR_PIPE_BUSY.0 as i32) {
+                    last_err = Some(e);
+                    sleep(Duration::from_millis(SLEEP_MS)).await;
+                    continue;
+                }
+
+                // Anything else: fail fast
+                return Err(e);
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| io::Error::new(ErrorKind::Other, "pipe open failed")))
+}
+
 async fn run_service(cfg: Config) -> anyhow::Result<()> {
-    // Use the binding type for PDH handles.
+    // Use the binding type for PDH handles (CWE-843).
     let mut h_query: PDH_HQUERY = PDH_HQUERY::default();
 
     // PDH: Open Query
@@ -36,8 +94,9 @@ async fn run_service(cfg: Config) -> anyhow::Result<()> {
         anyhow::bail!("PdhOpenQueryW failed with status: {}", status);
     }
 
-    // RAII guard ensures PdhCloseQuery is called on drop (as per your secure_guard design).
-    let _guard = secure_guard::PdhQueryGuard(h_query.0);
+    // CWE-404/CWE-843: typed RAII guard for correct shutdown/release.
+    // NOTE: This expects secure_guard::PdhQueryGuard::new(PDH_HQUERY).
+    let _guard = secure_guard::PdhQueryGuard::new(h_query);
 
     // Add counters
     let mut counters: Vec<(String, PDH_HCOUNTER)> = Vec::new();
@@ -48,7 +107,12 @@ async fn run_service(cfg: Config) -> anyhow::Result<()> {
         if status == 0 {
             counters.push((m.tag.clone(), h_c));
         } else {
-            warn!("Failed to add counter: {} (status: {})", m.path, status);
+            // CWE-117: sanitize config-controlled content
+            warn!(
+                "Failed to add counter: {} (status: {})",
+                sanitize_for_log(&m.path),
+                status
+            );
         }
     }
 
@@ -100,7 +164,6 @@ async fn run_service(cfg: Config) -> anyhow::Result<()> {
 
             // PDH marks validity via CStatus
             if v.CStatus != 0 {
-                // skip invalid/unavailable counter value
                 continue;
             }
 
@@ -111,7 +174,7 @@ async fn run_service(cfg: Config) -> anyhow::Result<()> {
             });
         }
 
-        // If nothing valid, continue quietly (but you may want a low-rate warn).
+        // If nothing valid, continue quietly.
         if samples.is_empty() {
             continue;
         }
@@ -119,15 +182,17 @@ async fn run_service(cfg: Config) -> anyhow::Result<()> {
         // Format payload (newline framing is handled by metrics::format_payload)
         let payload = metrics::format_payload(&samples);
 
-        // Named Pipe Transmission
-        match ClientOptions::new().open(&cfg.pipe_name) {
+        // Named Pipe Transmission (with bounded retry on NotFound / ERROR_PIPE_BUSY)
+        match open_pipe_with_retry(&cfg.pipe_name).await {
             Ok(mut pipe) => {
                 if let Err(e) = pipe.write_all(payload.as_bytes()).await {
                     pipe_failures = pipe_failures.saturating_add(1);
                     if pipe_failures <= 3 || pipe_failures % 60 == 0 {
                         error!(
                             "Failed to write to named pipe ({}): {}, failures={}",
-                            cfg.pipe_name, e, pipe_failures
+                            sanitize_for_log(&cfg.pipe_name),
+                            e,
+                            pipe_failures
                         );
                     }
                 } else {
@@ -139,7 +204,9 @@ async fn run_service(cfg: Config) -> anyhow::Result<()> {
                 if pipe_failures <= 3 || pipe_failures % 60 == 0 {
                     warn!(
                         "Named pipe open failure ({}): {}, failures={}",
-                        cfg.pipe_name, e, pipe_failures
+                        sanitize_for_log(&cfg.pipe_name),
+                        e,
+                        pipe_failures
                     );
                 }
             }
