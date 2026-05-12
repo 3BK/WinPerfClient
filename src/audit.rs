@@ -8,7 +8,6 @@ use windows::Win32::System::EventLog::{
 };
 
 fn sanitize_for_eventlog(s: &str) -> String {
-    // CWE-117: neutralize CR/LF so attackers can't forge multiple log records.
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {
@@ -16,14 +15,11 @@ fn sanitize_for_eventlog(s: &str) -> String {
             _ => out.push(ch),
         }
     }
-
-    // Cap size to prevent oversized events (cheap protection).
     const MAX: usize = 2048;
     if out.len() > MAX {
         out.truncate(MAX);
         out.push_str("…");
     }
-
     out
 }
 
@@ -39,12 +35,7 @@ fn parse_level_filter(s: &str) -> LevelFilter {
     }
 }
 
-fn default_level_filter() -> LevelFilter {
-    // Allow env override without extra crates.
-    // Examples:
-    //   WINPERF_LOG_LEVEL=debug
-    //   WINPERF_LOG_LEVEL=trace
-    // Default: info
+fn configured_level() -> LevelFilter {
     std::env::var("WINPERF_LOG_LEVEL")
         .ok()
         .as_deref()
@@ -52,23 +43,25 @@ fn default_level_filter() -> LevelFilter {
         .unwrap_or(LevelFilter::Info)
 }
 
-/// Windows Event Log logger implementing the `log` crate backend.
 pub struct WinEventLogger {
     handle: HANDLE,
     level: LevelFilter,
     lock: Mutex<()>,
 }
 
-impl WinEventLogger {
-    /// Initialize the EventLog logger and configure the maximum log level.
-    ///
-    /// Full range supported, including Debug/Trace, controlled by:
-    ///   WINPERF_LOG_LEVEL=trace|debug|info|warn|error|off
-    pub fn init(source_name: &str) -> Result<(), log::SetLoggerError> {
-        let level = default_level_filter();
+// The `log::Log` trait requires `Send + Sync`.
+// HANDLE wraps a raw pointer, so Rust doesn't auto-derive these traits.
+// This is safe here because:
+// - the handle is immutable after init
+// - calls are serialized by `lock`
+unsafe impl Send for WinEventLogger {}
+unsafe impl Sync for WinEventLogger {}
 
-        // Register once (avoid per-record churn).
+impl WinEventLogger {
+    pub fn init(source_name: &str) -> Result<(), log::SetLoggerError> {
+        let level = configured_level();
         let source = HSTRING::from(source_name);
+
         let handle = unsafe {
             RegisterEventSourceW(None, PCWSTR(source.as_ptr()))
                 .unwrap_or_else(|_| HANDLE::default())
@@ -81,7 +74,6 @@ impl WinEventLogger {
         }));
 
         log::set_logger(logger)?;
-        // IMPORTANT: set the global max level to what we want to allow.
         log::set_max_level(level);
         Ok(())
     }
@@ -97,22 +89,20 @@ impl WinEventLogger {
 
 impl Log for WinEventLogger {
     fn enabled(&self, metadata: &Metadata) -> bool {
-        // Respect configured filter (supports Debug/Trace when enabled).
+        if self.level == LevelFilter::Off {
+            return false;
+        }
         metadata.level() <= self.level.to_level().unwrap_or(Level::Error)
-            && self.level != LevelFilter::Off
     }
 
     fn log(&self, record: &Record) {
         if !self.enabled(record.metadata()) {
             return;
         }
-
-        // If registration failed, no-op (could optionally fallback to stderr).
         if self.handle == HANDLE::default() {
             return;
         }
 
-        // Compose message and neutralize.
         let module = record.module_path().unwrap_or("main");
         let msg = format!("[{}][{}] {}", module, record.level(), record.args());
         let msg = sanitize_for_eventlog(&msg);
@@ -120,20 +110,21 @@ impl Log for WinEventLogger {
         let msg_w = HSTRING::from(msg);
         let strings = [PCWSTR(msg_w.as_ptr())];
 
-        // Serialize access (conservative).
         let _g = self.lock.lock().ok();
 
         unsafe {
+            // IMPORTANT: windows-0.58 binding expects 8 args (per compiler error).
+            // Signature order in your build is:
+            //   (heventlog, wtype, wcategory, dweventid, lpusersid, dwdatasize, lprawdata, lpstrings)
             let _ = ReportEventW(
                 self.handle,
                 Self::map_level(record.level()),
                 0,      // category
                 1000,   // event id
                 None,   // user SID
-                1,      // num strings
                 0,      // data size
+                None,   // raw data pointer
                 Some(strings.as_ptr()),
-                None,   // raw data
             );
         }
     }
