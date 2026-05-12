@@ -1,5 +1,7 @@
 use log::{Level, LevelFilter, Log, Metadata, Record};
 use std::sync::Mutex;
+
+use core::ffi::c_void;
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::EventLog::{
@@ -49,11 +51,11 @@ pub struct WinEventLogger {
     lock: Mutex<()>,
 }
 
-// The `log::Log` trait requires `Send + Sync`.
-// HANDLE wraps a raw pointer, so Rust doesn't auto-derive these traits.
-// This is safe here because:
-// - the handle is immutable after init
-// - calls are serialized by `lock`
+// SAFETY JUSTIFICATION:
+// - `log::Log` requires Send + Sync (compile-time trait bound). 【1-088816】
+// - The underlying Win32 HANDLE is treated as an opaque token by Win32.
+// - We ensure *all* usage of `handle` is serialized via `lock`, including Drop.
+// - `handle` is immutable after init; it is never moved out or mutated.
 unsafe impl Send for WinEventLogger {}
 unsafe impl Sync for WinEventLogger {}
 
@@ -107,15 +109,16 @@ impl Log for WinEventLogger {
         let msg = format!("[{}][{}] {}", module, record.level(), record.args());
         let msg = sanitize_for_eventlog(&msg);
 
-        let msg_w = HSTRING::from(msg);
-        let strings = [PCWSTR(msg_w.as_ptr())];
-
+        // Serialize all handle use, including the FFI call.
         let _g = self.lock.lock().ok();
 
+        // Everything needed by the FFI call lives until it returns.
+        let msg_w = HSTRING::from(msg);
+        let strings = [PCWSTR(msg_w.as_ptr())];
+        let lpstrings: *const c_void = strings.as_ptr() as *const c_void;
+
         unsafe {
-            // IMPORTANT: windows-0.58 binding expects 8 args (per compiler error).
-            // Signature order in your build is:
-            //   (heventlog, wtype, wcategory, dweventid, lpusersid, dwdatasize, lprawdata, lpstrings)
+            // windows-0.58 binding in your build expects 8 args. 【1-088816】
             let _ = ReportEventW(
                 self.handle,
                 Self::map_level(record.level()),
@@ -124,7 +127,7 @@ impl Log for WinEventLogger {
                 None,   // user SID
                 0,      // data size
                 None,   // raw data pointer
-                Some(strings.as_ptr()),
+                Some(lpstrings),
             );
         }
     }
@@ -134,10 +137,15 @@ impl Log for WinEventLogger {
 
 impl Drop for WinEventLogger {
     fn drop(&mut self) {
-        if self.handle != HANDLE::default() {
-            unsafe {
-                let _ = DeregisterEventSource(self.handle);
-            }
+        if self.handle == HANDLE::default() {
+            return;
+        }
+
+        // Serialize drop against concurrent `log()` calls.
+        let _g = self.lock.lock().ok();
+
+        unsafe {
+            let _ = DeregisterEventSource(self.handle);
         }
     }
 }
