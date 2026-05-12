@@ -6,6 +6,7 @@ authors = ["Enterprise Security Team"]
 description = "A Static Windows Performance Metrics Client"
 
 [dependencies]
+log = "0.4"
 windows = { version = "0.58", features = [
     "Win32_System_Performance", # PDH Counters
     "Win32_Foundation",         # HANDLE and WIN32_ERROR
