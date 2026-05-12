@@ -7,8 +7,25 @@ use windows::Win32::System::EventLog::{
     EVENTLOG_INFORMATION_TYPE, EVENTLOG_WARNING_TYPE, REPORT_EVENT_TYPE,
 };
 
+fn sanitize_for_eventlog(s: &str) -> String {
+    // CWE-117: neutralize CR/LF so attackers can't forge multiple log records.
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\r' | '\n' => out.push(' '),
+            _ => out.push(ch),
+        }
+    }
+    // Cap size to prevent oversized events (cheap protection).
+    const MAX: usize = 2048;
+    if out.len() > MAX {
+        out.truncate(MAX);
+        out.push_str("…");
+    }
+    out
+}
+
 pub struct WinEventLogger {
-    source: HSTRING,
     handle: HANDLE,
     lock: Mutex<()>,
 }
@@ -17,14 +34,13 @@ impl WinEventLogger {
     pub fn init(source_name: &str) -> Result<(), log::SetLoggerError> {
         let source = HSTRING::from(source_name);
 
-        // CWE-400 fix: register once; reuse handle.
+        // Register once (avoids per-record churn).
         let handle = unsafe {
             RegisterEventSourceW(None, PCWSTR(source.as_ptr()))
                 .unwrap_or_else(|_| HANDLE::default())
         };
 
         let logger = Box::leak(Box::new(Self {
-            source,
             handle,
             lock: Mutex::new(()),
         }));
@@ -52,25 +68,21 @@ impl Log for WinEventLogger {
         if !self.enabled(record.metadata()) {
             return;
         }
-
-        // If registration failed, no-op.
         if self.handle == HANDLE::default() {
             return;
         }
 
-        let message = format!(
-            "[{}] {}",
-            record.module_path().unwrap_or("main"),
-            record.args()
-        );
-        let msg_w = HSTRING::from(message);
+        let module = record.module_path().unwrap_or("main");
+        let msg = format!("[{}] {}", module, record.args());
+        let msg = sanitize_for_eventlog(&msg);
+
+        let msg_w = HSTRING::from(msg);
         let strings = [PCWSTR(msg_w.as_ptr())];
 
-        // Serialize access (conservative).
+        // Serialize to be conservative with handle usage.
         let _g = self.lock.lock().ok();
 
         unsafe {
-            // ReportEventW signature in windows bindings includes raw data arg.
             let _ = ReportEventW(
                 self.handle,
                 Self::map_level(record.level()),
