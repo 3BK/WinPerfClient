@@ -3,12 +3,15 @@ mod audit;
 mod metrics;
 
 use std::time::Duration;
+
+use anyhow::Context;
+use log::{error, info, warn};
+use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
 use tokio::net::windows::named_pipe::ClientOptions;
+
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::System::Performance::*;
-use serde::Deserialize;
-use log::{info, warn, error};
 
 #[derive(Deserialize)]
 struct Config {
@@ -18,90 +21,147 @@ struct Config {
 }
 
 #[derive(Deserialize)]
-struct MetricDef { tag: String, path: String }
+struct MetricDef {
+    tag: String,
+    path: String,
+}
 
 async fn run_service(cfg: Config) -> anyhow::Result<()> {
-    let mut h_query = 0;
-    
-    // PDH: Open Query (u32 check)
+    // Use the binding type for PDH handles.
+    let mut h_query: PDH_HQUERY = PDH_HQUERY::default();
+
+    // PDH: Open Query
     let status = unsafe { PdhOpenQueryW(None, 0, &mut h_query) };
     if status != 0 {
-        anyhow::bail!("PdhOpenQueryW failed with status: {status}");
+        anyhow::bail!("PdhOpenQueryW failed with status: {}", status);
     }
-    
-    // RAII Guard ensures PdhCloseQuery is called on drop
-    let _guard = secure_guard::PdhQueryGuard(h_query);
 
-    let mut counters = Vec::new();
+    // RAII guard ensures PdhCloseQuery is called on drop (as per your secure_guard design).
+    let _guard = secure_guard::PdhQueryGuard(h_query.0);
+
+    // Add counters
+    let mut counters: Vec<(String, PDH_HCOUNTER)> = Vec::new();
     for m in &cfg.metrics {
-        let mut h_c = 0;
+        let mut h_c: PDH_HCOUNTER = PDH_HCOUNTER::default();
         let path = HSTRING::from(&m.path);
-        
         let status = unsafe { PdhAddCounterW(h_query, PCWSTR(path.as_ptr()), 0, &mut h_c) };
         if status == 0 {
             counters.push((m.tag.clone(), h_c));
         } else {
-            warn!("Failed to add counter: {} (Status: {})", m.path, status);
+            warn!("Failed to add counter: {} (status: {})", m.path, status);
         }
     }
 
-    let mut interval = tokio::time::interval(Duration::from_secs(cfg.interval_seconds));
+    if counters.is_empty() {
+        anyhow::bail!("No PDH counters successfully added; check config paths.");
+    }
+
+    let mut interval = tokio::time::interval(Duration::from_secs(cfg.interval_seconds.max(1)));
+
+    // CWE-778: rate-limited failure reporting counters
+    let mut collect_failures: u32 = 0;
+    let mut format_failures: u32 = 0;
+    let mut pipe_failures: u32 = 0;
+
     loop {
         interval.tick().await;
-        
-        // Collect Data
-        if unsafe { PdhCollectQueryData(h_query) } != 0 { 
-            continue; 
+
+        // Collect Data (CWE-703 + CWE-778)
+        let st_collect = unsafe { PdhCollectQueryData(h_query) };
+        if st_collect != 0 {
+            collect_failures = collect_failures.saturating_add(1);
+            if collect_failures <= 3 || collect_failures % 60 == 0 {
+                warn!(
+                    "PdhCollectQueryData failed (status: {}), failures={}",
+                    st_collect, collect_failures
+                );
+            }
+            continue;
+        } else {
+            collect_failures = 0;
         }
 
-        let samples: Vec<metrics::Sample> = counters.iter().map(|(tag, h)| {
+        // Build samples with PDH validation (CWE-703)
+        let mut samples: Vec<metrics::Sample> = Vec::with_capacity(counters.len());
+        for (tag, h) in &counters {
             let mut v = PDH_FMT_COUNTERVALUE::default();
-            
-            // FIX: Accessing union field 'Anonymous' requires unsafe block
-            let value = unsafe {
-                PdhGetFormattedCounterValue(*h, PDH_FMT_DOUBLE, None, &mut v);
-                v.Anonymous.doubleValue 
-            };
 
-            metrics::Sample { 
-                tag: tag.clone(), 
-                value 
+            let st = unsafe { PdhGetFormattedCounterValue(*h, PDH_FMT_DOUBLE, None, &mut v) };
+            if st != 0 {
+                format_failures = format_failures.saturating_add(1);
+                if format_failures <= 3 || format_failures % 200 == 0 {
+                    warn!(
+                        "PdhGetFormattedCounterValue failed (status: {}), failures={}",
+                        st, format_failures
+                    );
+                }
+                continue;
             }
-        }).collect();
 
+            // PDH marks validity via CStatus
+            if v.CStatus != 0 {
+                // skip invalid/unavailable counter value
+                continue;
+            }
+
+            let value = unsafe { v.Anonymous.doubleValue };
+            samples.push(metrics::Sample {
+                tag: tag.clone(),
+                value,
+            });
+        }
+
+        // If nothing valid, continue quietly (but you may want a low-rate warn).
+        if samples.is_empty() {
+            continue;
+        }
+
+        // Format payload (newline framing is handled by metrics::format_payload)
         let payload = metrics::format_payload(&samples);
-        
+
         // Named Pipe Transmission
         match ClientOptions::new().open(&cfg.pipe_name) {
             Ok(mut pipe) => {
                 if let Err(e) = pipe.write_all(payload.as_bytes()).await {
-                    error!("Failed to write to named pipe: {e}");
+                    pipe_failures = pipe_failures.saturating_add(1);
+                    if pipe_failures <= 3 || pipe_failures % 60 == 0 {
+                        error!(
+                            "Failed to write to named pipe ({}): {}, failures={}",
+                            cfg.pipe_name, e, pipe_failures
+                        );
+                    }
+                } else {
+                    pipe_failures = 0;
                 }
             }
             Err(e) => {
-                warn!("Named Pipe Connection Failure ({}): {e}", cfg.pipe_name);
+                pipe_failures = pipe_failures.saturating_add(1);
+                if pipe_failures <= 3 || pipe_failures % 60 == 0 {
+                    warn!(
+                        "Named pipe open failure ({}): {}, failures={}",
+                        cfg.pipe_name, e, pipe_failures
+                    );
+                }
             }
         }
-        
-        // Metrics samples are zeroized here upon drop if 'metrics::Sample' implements Zeroize
     }
 }
 
 #[tokio::main]
 async fn main() {
-    // NIST AU-12: Initialize global logger for Event Viewer
-    if let Err(e) = audit::WinEventLogger::init("WinPerfRelay") {
+    // Initialize global logger for Event Viewer auditing
+    if let Err(e) = audit::WinEventLogger::init("WinPerfClient") {
         eprintln!("Failed to initialize Windows Event Logger: {e}");
         return;
     }
 
-    info!("WinPerfRelay Service starting...");
+    info!("WinPerfClient starting...");
 
-    // NIST CM-6: Secure Configuration Loading
+    // Secure Configuration Loading
     let cfg_str = match std::fs::read_to_string("config.toml") {
         Ok(s) => s,
         Err(e) => {
-            error!("NIST CM-6: Missing Config: {e}");
+            error!("Missing config: {e}");
             return;
         }
     };
@@ -109,12 +169,12 @@ async fn main() {
     let cfg: Config = match toml::from_str(&cfg_str) {
         Ok(c) => c,
         Err(e) => {
-            error!("NIST CM-6: Invalid Config format: {e}");
+            error!("Invalid config format: {e}");
             return;
         }
     };
 
     if let Err(e) = run_service(cfg).await {
-        error!("Fatal Service Error: {e}");
+        error!("Fatal service error: {e:#}");
     }
 }
